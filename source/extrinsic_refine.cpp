@@ -12,16 +12,18 @@
 #include <Eigen/Dense>
 #include "ros/ros.h"
 
-#include "mypcl.hpp"
 #include "extrinsic_refine.hpp"
+#include "BA/mypcl.hpp"
+#include "BA/tools.hpp"
 
 using namespace std;
 using namespace Eigen;
-double voxel_size;
+double voxel_size, eigen_thr;
 
 void cut_voxel(unordered_map<VOXEL_LOC, OCTO_TREE*>& feature_map,
                pcl::PointCloud<PointType>::Ptr feature_pts,
-               Eigen::Quaterniond q, Eigen::Vector3d t, int f_head, int capacity,
+               Eigen::Quaterniond q, Eigen::Vector3d t, int f_head,
+               int window_size, double eigen_threshold,
                bool is_base_lidar = true)
 {
 	uint pt_size = feature_pts->size();
@@ -53,11 +55,10 @@ void cut_voxel(unordered_map<VOXEL_LOC, OCTO_TREE*>& feature_map,
         iter->second->refOriginPc[f_head]->emplace_back(pt_origin);
         iter->second->refTransPc[f_head]->emplace_back(pt_trans);
       }
-      iter->second->is2opt = true;
 		}
 		else
 		{
-      OCTO_TREE *ot = new OCTO_TREE(capacity);
+      OCTO_TREE* ot = new OCTO_TREE(window_size, eigen_threshold);
       if(is_base_lidar)
       {
         ot->baseOriginPc[f_head]->emplace_back(pt_origin);
@@ -73,6 +74,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OCTO_TREE*>& feature_map,
       ot->voxel_center[1] = (0.5 + position.y) * voxel_size;
       ot->voxel_center[2] = (0.5 + position.z) * voxel_size;
       ot->quater_length = voxel_size / 4.0;
+      ot->layer = 0;
       feature_map[position] = ot;
 		}
 	}
@@ -84,11 +86,12 @@ int main(int argc, char** argv)
   ros::NodeHandle nh("~");
 
   ros::Publisher pub_surf = nh.advertise<sensor_msgs::PointCloud2>("/map_surf", 100);
+  ros::Publisher pub_surf2 = nh.advertise<sensor_msgs::PointCloud2>("/map_surf2", 100);
   ros::Publisher pub_surf_debug = nh.advertise<sensor_msgs::PointCloud2>("/debug_surf", 100);
 
   string data_path, log_path;
   int max_iter, base_lidar, ref_lidar;
-  double downsmp_sz_base, downsmp_sz_ref;
+  double downsmp_base, downsmp_ref;
 
   nh.getParam("data_path", data_path);
   nh.getParam("log_path", log_path);
@@ -96,8 +99,9 @@ int main(int argc, char** argv)
   nh.getParam("base_lidar", base_lidar);
   nh.getParam("ref_lidar", ref_lidar);
   nh.getParam("voxel_size", voxel_size);
-  nh.getParam("downsmp_sz_base", downsmp_sz_base);
-  nh.getParam("downsmp_sz_ref", downsmp_sz_ref);
+  nh.getParam("eigen_threshold", eigen_thr);
+  nh.getParam("downsample_base", downsmp_base);
+  nh.getParam("downsample_ref", downsmp_ref);
 
   sensor_msgs::PointCloud2 debugMsg, colorCloudMsg;
   vector<mypcl::pose> pose_vec = mypcl::read_pose(data_path + "pose.json");
@@ -137,21 +141,17 @@ int main(int argc, char** argv)
 
     for(size_t i = 0; i < pose_size; i++)
     {
-      OCTO_TREE::voxel_windowsize = i+1;
-      downsample_voxel(*base_pc[i], downsmp_sz_base);
-      downsample_voxel(*ref_pc[i], downsmp_sz_ref);
+      if(downsmp_base > 0) downsample_voxel(*base_pc[i], downsmp_base);
+      if(downsmp_ref > 0) downsample_voxel(*ref_pc[i], downsmp_ref);
 
-      cut_voxel(surf_map, base_pc[i], pose_vec[i].q, pose_vec[i].t, i, pose_size);
-      for(auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
-        if(iter->second->is2opt)
-          iter->second->recut(0, i);
-
+      cut_voxel(surf_map, base_pc[i], pose_vec[i].q, pose_vec[i].t, i, pose_size, eigen_thr);
+      
       cut_voxel(surf_map, ref_pc[i], pose_vec[i].q * ref_vec[0].q,
-                pose_vec[i].q * ref_vec[0].t + pose_vec[i].t, i, pose_size, false);
-      for(auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
-        if(iter->second->is2opt)
-          iter->second->recut(0, i);
+                pose_vec[i].q * ref_vec[0].t + pose_vec[i].t, i, pose_size, eigen_thr, false);
     }
+
+    for(auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
+      iter->second->recut();
 
     for(size_t i = 0; i < pose_size; i++)
       assign_qt(lm_opt.poses[i], lm_opt.ts[i], pose_vec[i].q, pose_vec[i].t);
@@ -160,8 +160,7 @@ int main(int argc, char** argv)
       assign_qt(lm_opt.refQs[i], lm_opt.refTs[i], ref_vec[i].q, ref_vec[i].t);
 
     for(auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
-      if(iter->second->is2opt)
-        iter->second->feed_pt(lm_opt);
+      iter->second->feed_pt(lm_opt);
 
     lm_opt.optimize();
 
@@ -176,13 +175,11 @@ int main(int argc, char** argv)
     avg_time += (t_end-t_begin).toSec();
 
     pc_color->clear();
-    Eigen::Quaterniond q0(pose_vec[0].q.w(), pose_vec[0].q.x(),
-                          pose_vec[0].q.y(), pose_vec[0].q.z());
+    Eigen::Quaterniond q0(pose_vec[0].q.w(), pose_vec[0].q.x(), pose_vec[0].q.y(), pose_vec[0].q.z());
     Eigen::Vector3d t0(pose_vec[0].t(0), pose_vec[0].t(1), pose_vec[0].t(2));
     for(size_t i = 0; i < pose_size; i++)
     {
-      mypcl::transform_pointcloud(*base_pc[i], *pc_debug,
-        q0.inverse()*(pose_vec[i].t-t0), q0.inverse()*pose_vec[i].q);
+      mypcl::transform_pointcloud(*base_pc[i], *pc_debug, q0.inverse()*(pose_vec[i].t-t0), q0.inverse()*pose_vec[i].q);
       pc_color = mypcl::append_cloud(pc_color, *pc_debug);
       
       mypcl::transform_pointcloud(*ref_pc[i], *pc_debug,
@@ -202,15 +199,12 @@ int main(int argc, char** argv)
   cout << "averaged iteration time " << avg_time / (loop+1) << endl;
   mypcl::write_ref(ref_vec, data_path);
 
-  pc_color->clear();
-  Eigen::Quaterniond q0(pose_vec[0].q.w(), pose_vec[0].q.x(),
-                        pose_vec[0].q.y(), pose_vec[0].q.z());
+  Eigen::Quaterniond q0(pose_vec[0].q.w(), pose_vec[0].q.x(), pose_vec[0].q.y(), pose_vec[0].q.z());
   Eigen::Vector3d t0(pose_vec[0].t(0), pose_vec[0].t(1), pose_vec[0].t(2));
   for(size_t i = 0; i < pose_size; i++)
   {
     pcl::io::loadPCDFile(data_path+to_string(base_lidar)+"/"+to_string(i)+".pcd", *pc_surf);
-    mypcl::transform_pointcloud(*pc_surf, *pc_surf,
-      q0.inverse()*(pose_vec[i].t-t0), q0.inverse()*pose_vec[i].q);
+    mypcl::transform_pointcloud(*pc_surf, *pc_surf, q0.inverse()*(pose_vec[i].t-t0), q0.inverse()*pose_vec[i].q);
     pcl::toROSMsg(*pc_surf, colorCloudMsg);
     colorCloudMsg.header.frame_id = "camera_init";
     colorCloudMsg.header.stamp = cur_t;
@@ -223,10 +217,10 @@ int main(int argc, char** argv)
     pcl::toROSMsg(*pc_surf, colorCloudMsg);
     colorCloudMsg.header.frame_id = "camera_init";
     colorCloudMsg.header.stamp = cur_t;
-    pub_surf.publish(colorCloudMsg);
+    pub_surf2.publish(colorCloudMsg);
   }
 
-  ros::Rate loop_rate(1);
+  ros::Rate loop_rate(10);
   while(ros::ok())
   {
     ros::spinOnce();
